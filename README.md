@@ -16,7 +16,7 @@ validator's local pool (e.g. an `infer-worker-vllm` deployment with the same
 weights and kernel pack). Re-issuing the audited request to the *operator's*
 worker would let a malicious operator cache the validator's deterministic
 input and return the (already-tampered) answer — defeating the entire replay
-scheme. See plan §0.3 ("validators dogfood the network").
+scheme. Validators dogfood the network — running the same client other operators run is the cheapest way to keep us honest.
 
 ## Chain RPC
 
