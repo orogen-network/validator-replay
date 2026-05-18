@@ -1,0 +1,49 @@
+[project]
+name = "validator-replay"
+version = "0.1.0"
+description = "Stake-weighted receipt sampler + replay + slashing submitter."
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+    "pydantic>=2.7,<3.0",
+    "mining-types",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/validator_replay"]
+
+[tool.uv.sources]
+mining-types = { git = "https://github.com/orogen-network/mining-types.git", rev = "9e6d3127ce85622c65d994843be57f7efcc632b4" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "UP042"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
