@@ -474,6 +474,29 @@ def test_worker_replay_path_mismatches_when_worker_disagrees(
 
 
 @respx.mock
+def test_worker_replay_path_mismatches_when_worker_rejects_replay_input(
+    worker_config: ValidatorConfig,
+) -> None:
+    receipt = _make_receipt("op-1", "j-w-reject", response_hash="claimed-X")
+    respx.post("http://worker.test/v1/replay").mock(
+        return_value=httpx.Response(400, json={"detail": "request_hash mismatch"})
+    )
+    app = build_app(worker_config)
+    with TestClient(app) as c:
+        r = c.post(
+            "/replay",
+            json={
+                "receipts": [receipt.model_dump(mode="json")],
+                "replay_inputs": {receipt.job_id: _replay_input()},
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()["results"][0]
+        assert out["verdict"] == "mismatch"
+        assert out["fault"] == "WrongResponse"
+
+
+@respx.mock
 def test_worker_replay_path_skips_when_worker_unreachable(
     worker_config: ValidatorConfig,
 ) -> None:
@@ -494,6 +517,42 @@ def test_worker_replay_requires_original_input(worker_config: ValidatorConfig) -
     res = replay_receipt(receipt, worker_url=worker_config.worker_replay_url)
     assert res.verdict == ReplayVerdict.SKIPPED
     assert "replay input required" in res.detail
+
+
+def test_run_epoch_queues_slashing_when_worker_rejects_replay_input(
+    worker_config: ValidatorConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VALIDATOR_ALLOW_STUB_CHAIN", "1")
+    request = httpx.Request("POST", "http://worker.test/v1/replay")
+    response = httpx.Response(
+        400,
+        json={"detail": "request_hash mismatch"},
+        request=request,
+    )
+    monkeypatch.setattr(
+        "validator_replay.replay.replay_via_worker",
+        lambda _receipt, _worker_url, _replay_input: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("request_hash mismatch", request=request, response=response)
+        ),
+    )
+    receipt = _make_receipt("op-1", "j-w-reject-epoch", response_hash="claimed-X")
+    app = build_app(worker_config)
+    with TestClient(app) as c:
+        r = c.post(
+            "/run_epoch",
+            json={
+                "epoch_seed": "seed",
+                "receipts": [receipt.model_dump(mode="json")],
+                "operator_stake": {"op-1": 100},
+                "replay_inputs": {receipt.job_id: _replay_input()},
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["verdicts"][0]["verdict"] == "mismatch"
+        assert body["verdicts"][0]["fault"] == "WrongResponse"
+        assert body["queued_locally"] == 1
 
 
 @respx.mock

@@ -136,6 +136,20 @@ def replay_receipt(
             )
         try:
             replay_response = replay_via_worker(receipt, worker_url, replay_input)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {400, 422}:
+                return ReplayResult(
+                    receipt=receipt,
+                    verdict=ReplayVerdict.MISMATCH,
+                    fault=FaultCode.WRONG_RESPONSE,
+                    detail=f"worker rejected replay input: HTTP {exc.response.status_code}",
+                )
+            return ReplayResult(
+                receipt=receipt,
+                verdict=ReplayVerdict.SKIPPED,
+                fault=None,
+                detail=f"worker rejected replay request: HTTP {exc.response.status_code}",
+            )
         except httpx.HTTPError as exc:
             return ReplayResult(
                 receipt=receipt,
