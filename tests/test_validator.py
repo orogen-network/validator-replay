@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -9,6 +10,18 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 from mining_types import FaultCode, Receipt, SlashingEvidence, generate_keypair
+
+from validator_replay import OperatorRegistry, ValidatorConfig, build_app
+from validator_replay.chain import (
+    ChainRpcClient,
+    ChainUnreachableError,
+    _decode_compact,
+    _encode_compact,
+    _encode_slashing_extrinsic,
+    _to_32,
+)
+from validator_replay.replay import ReplayVerdict, replay_receipt
+from validator_replay.sampler import CommitReveal, StakeWeightedSampler
 
 
 @pytest.fixture(autouse=True)
@@ -22,19 +35,6 @@ def _allow_plaintext_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     # monkeypatch.delenv when they want to exercise the verification path.
     monkeypatch.setenv("ALLOW_UNSIGNED_INGEST", "1")
 
-from validator_replay import OperatorRegistry, ValidatorConfig, build_app
-from validator_replay.chain import (
-    ChainRpcClient,
-    ChainUnreachableError,
-    _decode_compact,
-    _encode_compact,
-    _encode_slashing_extrinsic,
-    _stub_operators,
-    _to_32,
-)
-from validator_replay.replay import ReplayVerdict, replay_receipt
-from validator_replay.sampler import CommitReveal, StakeWeightedSampler
-
 
 def _make_receipt(op: str, job: str, response_hash: str = "rs", model_weight: str = "w") -> Receipt:
     return Receipt(
@@ -44,6 +44,14 @@ def _make_receipt(op: str, job: str, response_hash: str = "rs", model_weight: st
         kernel_pack_hash="k", attestation_report_hash="a",
         timestamp_ms=1, gateway_id="gw",
     )
+
+
+def _replay_input() -> dict[str, object]:
+    return {
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8,
+        "seed": 0,
+    }
 
 
 @pytest.fixture
@@ -84,9 +92,20 @@ def test_sampler_stake_weighting_biases_toward_heavy() -> None:
     assert heavy >= len(chosen) // 2
 
 
-def test_replay_match_path() -> None:
+def test_replay_match_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALIDATOR_ALLOW_STUB_REPLAY", "1")
     r = _make_receipt("op", "j-1")
     assert replay_receipt(r).verdict == ReplayVerdict.MATCH
+
+
+def test_replay_without_worker_is_skipped_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VALIDATOR_ALLOW_STUB_REPLAY", raising=False)
+    r = _make_receipt("op", "j-no-worker")
+    out = replay_receipt(r)
+    assert out.verdict == ReplayVerdict.SKIPPED
+    assert "worker_replay_url required" in out.detail
 
 
 def test_replay_response_mismatch() -> None:
@@ -108,6 +127,46 @@ def test_healthz(config: ValidatorConfig) -> None:
     with TestClient(app) as c:
         r = c.get("/healthz")
         assert r.status_code == 200
+        body = r.json()
+        assert body["replay_input_policy"] == "ephemeral"
+        assert body["replay_input_max_bytes"] > 0
+
+
+def test_production_worker_replay_requires_explicit_replay_input_policy(
+    config: ValidatorConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    monkeypatch.delenv("VALIDATOR_REPLAY_INPUT_POLICY", raising=False)
+    cfg = ValidatorConfig(
+        validator_id=config.validator_id,
+        validator_private_key_hex=config.validator_private_key_hex,
+        worker_replay_url="http://worker.test",
+    )
+    with pytest.raises(RuntimeError, match="VALIDATOR_REPLAY_INPUT_POLICY=ephemeral"):
+        build_app(cfg)
+
+
+def test_production_worker_replay_accepts_ephemeral_policy(
+    config: ValidatorConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    monkeypatch.setenv("VALIDATOR_REPLAY_INPUT_POLICY", "ephemeral")
+    monkeypatch.setenv("VALIDATOR_API_TOKEN", "validator-secret")
+    cfg = ValidatorConfig(
+        validator_id=config.validator_id,
+        validator_private_key_hex=config.validator_private_key_hex,
+        worker_replay_url="http://worker.test",
+    )
+    app = build_app(cfg)
+    with TestClient(app) as c:
+        r = c.get(
+            "/healthz",
+            headers={"Authorization": "Bearer validator-secret"},
+        )
+        assert r.status_code == 200
+        assert r.json()["replay_input_policy"] == "ephemeral"
 
 
 def _hex_op(i: int) -> str:
@@ -138,30 +197,41 @@ def test_run_epoch_clean_pass(
         assert "queued_locally" in body
 
 
-def test_run_epoch_with_forced_mismatch(
+def test_run_epoch_queues_slashing_on_worker_replay_mismatch(
     config: ValidatorConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("VALIDATOR_ALLOW_STUB_CHAIN", "1")
-    app = build_app(config)
+    monkeypatch.setattr(
+        "validator_replay.replay.replay_via_worker",
+        lambda _receipt, _worker_url, _replay_input: "honest",
+    )
+    cfg = ValidatorConfig(
+        validator_id=config.validator_id,
+        validator_private_key_hex=config.validator_private_key_hex,
+        sample_rate=1.0,
+        worker_replay_url="http://worker.test",
+        replay_input_policy="ephemeral",
+    )
+    app = build_app(cfg)
     bad = "ff" * 32
-    receipts = [_make_receipt(bad, "j-1")] + [
-        _make_receipt(_hex_op(i), f"j-{i+1}") for i in range(7)
-    ]
+    receipt = _make_receipt(bad, "j-1", response_hash="dishonest")
     with TestClient(app) as c:
         r = c.post(
             "/run_epoch",
             json={
-                "receipts": [x.model_dump(mode="json") for x in receipts],
+                "receipts": [receipt.model_dump(mode="json")],
                 "epoch_seed": "seed-1",
-                "operator_stake": {bad: 1000, **{_hex_op(i): 10 for i in range(7)}},
-                "force_mismatch_operator": bad,
+                "operator_stake": {bad: 1000},
+                "replay_inputs": {"j-1": _replay_input()},
             },
         )
         assert r.status_code == 200
         body = r.json()
-        # Heavy-stake bad op is likely sampled; if so we should see at least one slashing.
-        # If by luck not sampled, the test still passes (slashings = 0, no mismatch).
-        assert body["slashings_submitted"] >= 0
+        assert body["sampled_count"] == 1
+        assert body["slashings_submitted"] == 1
+        assert body["queued_locally"] == 1
+        assert body["verdicts"][0]["verdict"] == "mismatch"
+        assert body["verdicts"][0]["fault"] == "WrongResponse"
 
 
 def test_run_epoch_returns_503_when_chain_unreachable_and_no_stake_provided(
@@ -356,17 +426,24 @@ def worker_config() -> ValidatorConfig:
 
 @respx.mock
 def test_worker_replay_path_matches_when_worker_agrees(
-    worker_config: ValidatorConfig,
+    worker_config: ValidatorConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("VALIDATOR_WORKER_API_TOKEN", "worker-secret")
     receipt = _make_receipt("op-1", "j-w-match", response_hash="abc123")
-    respx.post("http://worker.test/v1/replay").mock(
-        return_value=httpx.Response(200, json={"response_hash": "abc123"})
-    )
+
+    def _worker(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer worker-secret"
+        return httpx.Response(200, json={"response_hash": "abc123"})
+
+    respx.post("http://worker.test/v1/replay").mock(side_effect=_worker)
     app = build_app(worker_config)
     with TestClient(app) as c:
         r = c.post(
             "/replay",
-            json={"receipts": [receipt.model_dump(mode="json")]},
+            json={
+                "receipts": [receipt.model_dump(mode="json")],
+                "replay_inputs": {receipt.job_id: _replay_input()},
+            },
         )
         assert r.status_code == 200
         out = r.json()["results"][0]
@@ -385,7 +462,10 @@ def test_worker_replay_path_mismatches_when_worker_disagrees(
     with TestClient(app) as c:
         r = c.post(
             "/replay",
-            json={"receipts": [receipt.model_dump(mode="json")]},
+            json={
+                "receipts": [receipt.model_dump(mode="json")],
+                "replay_inputs": {receipt.job_id: _replay_input()},
+            },
         )
         assert r.status_code == 200
         out = r.json()["results"][0]
@@ -401,8 +481,104 @@ def test_worker_replay_path_skips_when_worker_unreachable(
     respx.post("http://worker.test/v1/replay").mock(
         side_effect=httpx.ConnectError("nope")
     )
+    res = replay_receipt(
+        receipt,
+        worker_url=worker_config.worker_replay_url,
+        replay_input=_replay_input(),
+    )
+    assert res.verdict == ReplayVerdict.SKIPPED
+
+
+def test_worker_replay_requires_original_input(worker_config: ValidatorConfig) -> None:
+    receipt = _make_receipt("op-1", "j-no-input", response_hash="x")
     res = replay_receipt(receipt, worker_url=worker_config.worker_replay_url)
     assert res.verdict == ReplayVerdict.SKIPPED
+    assert "replay input required" in res.detail
+
+
+@respx.mock
+def test_worker_replay_input_cannot_override_receipt_fields(
+    worker_config: ValidatorConfig,
+) -> None:
+    receipt = _make_receipt("op-1", "j-bound", response_hash="ok")
+
+    def _worker(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["job_id"] == "j-bound"
+        assert payload["model_id"] == "m"
+        assert payload["customer_nonce"] == "n"
+        assert payload["request_hash"] == "rq"
+        return httpx.Response(200, json={"response_hash": "ok"})
+
+    respx.post("http://worker.test/v1/replay").mock(side_effect=_worker)
+    res = replay_receipt(
+        receipt,
+        worker_url=worker_config.worker_replay_url,
+        replay_input={
+            **_replay_input(),
+            "job_id": "attacker-job",
+            "model_id": "attacker-model",
+            "customer_nonce": "attacker-nonce",
+            "request_hash": "attacker-hash",
+        },
+    )
+    assert res.verdict == ReplayVerdict.MATCH
+
+
+def test_replay_inputs_are_size_bounded_by_ephemeral_policy(
+    worker_config: ValidatorConfig,
+) -> None:
+    cfg = ValidatorConfig(
+        validator_id=worker_config.validator_id,
+        validator_private_key_hex=worker_config.validator_private_key_hex,
+        sample_rate=worker_config.sample_rate,
+        worker_replay_url=worker_config.worker_replay_url,
+        replay_input_policy="ephemeral",
+        replay_input_max_bytes=32,
+    )
+    receipt = _make_receipt("op-1", "j-too-big", response_hash="x")
+    app = build_app(cfg)
+    with TestClient(app) as c:
+        r = c.post(
+            "/replay",
+            json={
+                "receipts": [receipt.model_dump(mode="json")],
+                "replay_inputs": {
+                    receipt.job_id: {
+                        "messages": [{"role": "user", "content": "x" * 128}],
+                        "max_tokens": 8,
+                        "seed": 0,
+                    }
+                },
+            },
+        )
+        assert r.status_code == 413
+
+
+@respx.mock
+def test_replay_inputs_are_not_returned_by_api(worker_config: ValidatorConfig) -> None:
+    receipt = _make_receipt("op-1", "j-private", response_hash="ok")
+    respx.post("http://worker.test/v1/replay").mock(
+        return_value=httpx.Response(200, json={"response_hash": "ok"})
+    )
+    app = build_app(worker_config)
+    with TestClient(app) as c:
+        r = c.post(
+            "/replay",
+            json={
+                "receipts": [receipt.model_dump(mode="json")],
+                "replay_inputs": {
+                    receipt.job_id: {
+                        "messages": [{"role": "user", "content": "private prompt"}],
+                        "max_tokens": 8,
+                        "seed": 0,
+                    }
+                },
+            },
+        )
+        assert r.status_code == 200
+        assert "private prompt" not in r.text
+        assert "replay_inputs" not in r.text
 
 
 # ------------------------------------------------------------------ /internal/operators

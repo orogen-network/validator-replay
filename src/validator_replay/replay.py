@@ -17,8 +17,10 @@ would defeat the entire scheme.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 import httpx
 from mining_types import FaultCode, Receipt
@@ -39,12 +41,17 @@ class ReplayResult:
     detail: str = ""
 
 
-def replay_via_worker(receipt: Receipt, worker_url: str) -> str:
+def replay_via_worker(
+    receipt: Receipt,
+    worker_url: str,
+    replay_input: dict[str, Any],
+) -> str:
     """Issue a `POST {worker_url}/v1/replay` for the receipt under audit and
     return the worker's freshly-computed response_hash.
 
-    Request shape (mirrors RFC-0001 §replay):
-        {"job_id":..., "model_id":..., "request_hash":..., "customer_nonce":...}
+    Request shape includes the original replay input, not just hashes. A
+    validator cannot independently recompute the response hash from
+    `request_hash` alone.
 
     Response shape:
         {"response_hash": "deadbeef..."}
@@ -53,13 +60,24 @@ def replay_via_worker(receipt: Receipt, worker_url: str) -> str:
     that constitutes a SKIPPED verdict or hard failure.
     """
     payload = {
+        **replay_input,
         "job_id": receipt.job_id,
         "model_id": receipt.model_id,
-        "request_hash": receipt.request_hash,
         "customer_nonce": receipt.customer_nonce,
+        "request_hash": receipt.request_hash,
     }
+    token = (
+        os.environ.get("VALIDATOR_WORKER_API_TOKEN", "")
+        or os.environ.get("WORKER_API_TOKEN", "")
+        or os.environ.get("INTERNAL_AUTH_TOKEN", "")
+    ).strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     with httpx.Client(timeout=10.0) as client:
-        resp = client.post(f"{worker_url.rstrip('/')}/v1/replay", json=payload)
+        resp = client.post(
+            f"{worker_url.rstrip('/')}/v1/replay",
+            json=payload,
+            headers=headers,
+        )
         resp.raise_for_status()
         body = resp.json()
     return str(body["response_hash"])
@@ -74,20 +92,29 @@ def _placeholder_replay_hash(receipt: Receipt) -> str:
     return sha256_hex((receipt.request_hash + "::placeholder").encode())
 
 
+def allow_stub_replay() -> bool:
+    return os.environ.get("VALIDATOR_ALLOW_STUB_REPLAY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def replay_receipt(
     receipt: Receipt,
     *,
     expected_response_hash: str | None = None,
     expected_model_weight_hash: str | None = None,
     worker_url: str | None = None,
+    replay_input: dict[str, Any] | None = None,
 ) -> ReplayResult:
     """Compare declared receipt vs. replay output.
 
     Decision order for the comparison hash:
       1. `expected_response_hash` — test override.
-      2. `worker_url` — issue a live replay against the validator's worker.
-      3. fall back to `receipt.response_hash` (zero-effort match) — used by
-         tests that exercise the harness without a live worker.
+      2. `worker_url` + `replay_input` — issue a live replay against the validator's worker.
+      3. explicit `VALIDATOR_ALLOW_STUB_REPLAY=1` dev/test mode.
+      4. otherwise fail closed with a skipped verdict; never self-attest.
     """
     if expected_model_weight_hash and expected_model_weight_hash != receipt.model_weight_hash:
         return ReplayResult(
@@ -100,8 +127,15 @@ def replay_receipt(
     if expected_response_hash is not None:
         replay_response = expected_response_hash
     elif worker_url:
+        if replay_input is None:
+            return ReplayResult(
+                receipt=receipt,
+                verdict=ReplayVerdict.SKIPPED,
+                fault=None,
+                detail="replay input required for worker replay",
+            )
         try:
-            replay_response = replay_via_worker(receipt, worker_url)
+            replay_response = replay_via_worker(receipt, worker_url, replay_input)
         except httpx.HTTPError as exc:
             return ReplayResult(
                 receipt=receipt,
@@ -109,10 +143,15 @@ def replay_receipt(
                 fault=None,
                 detail=f"worker unreachable: {exc}",
             )
-    else:
-        # No worker configured + no explicit override: treat the receipt as
-        # self-attesting. Tests rely on this branch.
+    elif allow_stub_replay():
         replay_response = receipt.response_hash
+    else:
+        return ReplayResult(
+            receipt=receipt,
+            verdict=ReplayVerdict.SKIPPED,
+            fault=None,
+            detail="worker_replay_url required unless VALIDATOR_ALLOW_STUB_REPLAY=1",
+        )
 
     if replay_response != receipt.response_hash:
         return ReplayResult(
@@ -128,6 +167,7 @@ __all__ = [
     "ReplayResult",
     "ReplayVerdict",
     "_placeholder_replay_hash",
+    "allow_stub_replay",
     "replay_receipt",
     "replay_via_worker",
 ]

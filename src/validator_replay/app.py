@@ -9,50 +9,180 @@ Endpoints (deliberately RPC-style, since real chain interaction is mocked):
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 import secrets
-from typing import Any
+from collections.abc import Callable
+from typing import Annotated, Any
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mining_types import Receipt, SlashingEvidence
 from mining_types.crypto import sha256_hex, verify_ed25519
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from validator_replay.chain import ChainRpcClient, ChainUnreachableError
 from validator_replay.config import ValidatorConfig
 from validator_replay.registry import OperatorRegistry, allow_unsigned_ingest
-from validator_replay.replay import ReplayVerdict, replay_receipt
+from validator_replay.replay import ReplayResult, ReplayVerdict, replay_receipt
 from validator_replay.sampler import CommitReveal, StakeWeightedSampler
 
 logger = logging.getLogger(__name__)
+_BEARER = HTTPBearer(auto_error=False)
+_REPLAY_INPUT_PATHS = {"/replay", "/run_epoch"}
+
+
+def _is_production() -> bool:
+    return os.environ.get("OROGEN_ENV", "").lower() == "production"
+
+
+def _expected_api_token() -> str:
+    return (
+        os.environ.get("VALIDATOR_API_TOKEN", "")
+        or os.environ.get("INTERNAL_AUTH_TOKEN", "")
+    ).strip()
+
+
+async def require_validator_auth(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)] = None,
+) -> None:
+    expected = _expected_api_token()
+    if not expected:
+        if _is_production():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="validator api token not configured",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return
+    if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="validator auth required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 class SampleRequest(BaseModel):
     receipts: list[Receipt]
     epoch_seed: str
-    operator_stake: dict[str, int] = {}
+    operator_stake: dict[str, int] = Field(default_factory=dict)
 
 
 class ReplayRequest(BaseModel):
     receipts: list[Receipt]
-    # If provided, override response_hash to simulate mismatch
-    override_response_hash_for: dict[str, str] = {}
-    override_model_weight_hash_for: dict[str, str] = {}
+    replay_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class RunEpochRequest(BaseModel):
     receipts: list[Receipt]
     epoch_seed: str
-    operator_stake: dict[str, int] = {}
-    force_mismatch_operator: str | None = None
+    operator_stake: dict[str, int] = Field(default_factory=dict)
+    replay_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+def _json_size_bytes(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+class ReplayInputBodyLimitMiddleware:
+    """ASGI request-body limiter for routes that can carry replay inputs."""
+
+    def __init__(
+        self,
+        app: Callable[[dict[str, Any], Callable[..., Any], Callable[..., Any]], Any],
+        *,
+        max_bytes: int,
+    ) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[[], Any],
+        send: Callable[[dict[str, Any]], Any],
+    ) -> None:
+        if scope.get("type") != "http" or scope.get("path") not in _REPLAY_INPUT_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.lower(): value
+            for key, value in scope.get("headers", [])
+        }
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self.max_bytes:
+                    await self._send_413(send)
+                    return
+            except ValueError:
+                pass
+
+        seen = 0
+        response_started = False
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal seen
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.max_bytes:
+                    raise ReplayInputTooLarge
+            return message
+
+        async def tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except ReplayInputTooLarge:
+            if not response_started:
+                await self._send_413(send)
+
+    async def _send_413(self, send: Callable[[dict[str, Any]], Any]) -> None:
+        body = json.dumps({
+            "detail": (
+                "replay request body too large for configured ephemeral policy "
+                f"(max {self.max_bytes} bytes)"
+            )
+        }).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class ReplayInputTooLarge(Exception):
+    pass
+
+
+async def _replay_receipt_async(receipt: Receipt, **kwargs: Any) -> ReplayResult:
+    return await asyncio.to_thread(replay_receipt, receipt, **kwargs)
 
 
 def build_app(
     config: ValidatorConfig,
     registry: OperatorRegistry | None = None,
 ) -> FastAPI:
+    config.validate_replay_input_policy(production=_is_production())
     app = FastAPI(title="validator-replay", version="0.1.0")
+    app.add_middleware(
+        ReplayInputBodyLimitMiddleware,
+        max_bytes=config.replay_input_max_bytes,
+    )
     app.state.config = config
     app.state.chain_client = ChainRpcClient(config.resolved_chain_rpc_url())
     reg = registry or OperatorRegistry.from_env()
@@ -110,16 +240,39 @@ def build_app(
         salts_by_epoch[epoch_seed] = new_salt
         return new_salt
 
+    def _enforce_replay_input_policy(replay_inputs: dict[str, dict[str, Any]]) -> None:
+        """Apply the replay-input privacy boundary before worker replay.
+
+        The validator needs original request inputs to independently recompute a
+        response, but this service must not become a durable prompt store. The
+        implemented policy is deliberately narrow: bound request size, keep the
+        values only in request-local memory, and never include them in responses
+        or logs.
+        """
+        if not replay_inputs:
+            return
+        size = _json_size_bytes(replay_inputs)
+        if size > config.replay_input_max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "replay_inputs too large for configured ephemeral policy "
+                    f"({size} > {config.replay_input_max_bytes} bytes)"
+                ),
+            )
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {
             "ok": True,
             "validator_id": config.validator_id,
             "chain_rpc_url": config.resolved_chain_rpc_url(),
+            "replay_input_policy": config.resolved_replay_input_policy(),
+            "replay_input_max_bytes": config.replay_input_max_bytes,
             "sink_status_counts": dict(sink_status_counts),
         }
 
-    @app.get("/internal/operators")
+    @app.get("/internal/operators", dependencies=[Depends(require_validator_auth)])
     async def operators() -> dict[str, Any]:
         """Surface the chain-derived operator set + stakes.
 
@@ -129,8 +282,6 @@ def build_app(
         try:
             ops = app.state.chain_client.get_operator_stakes()
         except ChainUnreachableError as exc:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
             "rpc_url": config.resolved_chain_rpc_url(),
@@ -140,7 +291,7 @@ def build_app(
             ],
         }
 
-    @app.post("/sample")
+    @app.post("/sample", dependencies=[Depends(require_validator_auth)])
     async def sample(req: SampleRequest) -> dict[str, Any]:
         # N-W-01: drop receipts with unknown / invalid operator signatures
         # BEFORE sampling, so the sampled set can't include forgeries.
@@ -161,21 +312,19 @@ def build_app(
             "rejected_invalid_signature": invalid,
         }
 
-    @app.post("/replay")
+    @app.post("/replay", dependencies=[Depends(require_validator_auth)])
     async def replay(req: ReplayRequest) -> dict[str, Any]:
+        _enforce_replay_input_policy(req.replay_inputs)
         # N-W-01: refuse to act on forged receipts. Unknown / invalid
         # signatures are dropped before replay.
         accepted, unknown, invalid = _verify_receipts(req.receipts)
         results: list[dict[str, Any]] = []
         worker_url = config.worker_replay_url or None
         for r in accepted:
-            override_resp = req.override_response_hash_for.get(r.operator_id)
-            override_w = req.override_model_weight_hash_for.get(r.operator_id)
-            res = replay_receipt(
+            res = await _replay_receipt_async(
                 r,
-                expected_response_hash=override_resp,
-                expected_model_weight_hash=override_w,
-                worker_url=worker_url if override_resp is None else None,
+                worker_url=worker_url,
+                replay_input=req.replay_inputs.get(r.job_id),
             )
             results.append(
                 {
@@ -192,8 +341,9 @@ def build_app(
             "rejected_invalid_signature": invalid,
         }
 
-    @app.post("/run_epoch")
+    @app.post("/run_epoch", dependencies=[Depends(require_validator_auth)])
     async def run_epoch(req: RunEpochRequest) -> dict[str, Any]:
+        _enforce_replay_input_policy(req.replay_inputs)
         # N-W-01: refuse to act on forged receipts. Slashing evidence
         # generated from a forged receipt would let an attacker grief any
         # operator simply by submitting a hand-crafted Receipt.
@@ -209,8 +359,6 @@ def build_app(
                     for o in app.state.chain_client.get_operator_stakes()
                 }
             except ChainUnreachableError as exc:
-                from fastapi import HTTPException
-
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         sampler = StakeWeightedSampler(
             sample_rate=config.sample_rate, operator_stake=operator_stake,
@@ -226,16 +374,10 @@ def build_app(
         submitted_to_chain = 0
         queued_locally = 0
         for r in sampled:
-            override = (
-                "deadbeef" * 8
-                if req.force_mismatch_operator
-                and r.operator_id == req.force_mismatch_operator
-                else None
-            )
-            res = replay_receipt(
+            res = await _replay_receipt_async(
                 r,
-                expected_response_hash=override,
-                worker_url=worker_url if override is None else None,
+                worker_url=worker_url,
+                replay_input=req.replay_inputs.get(r.job_id),
             )
             verdicts.append({
                 "job_id": r.job_id,
@@ -296,7 +438,7 @@ def build_app(
             "rejected_invalid_signature": invalid,
         }
 
-    @app.get("/internal/slashings")
+    @app.get("/internal/slashings", dependencies=[Depends(require_validator_auth)])
     async def slashings() -> dict[str, Any]:
         # Filter only the slashings from the most recent run.
         items = [s.model_dump(mode="json") for s in app.state.slashing_submitted]
