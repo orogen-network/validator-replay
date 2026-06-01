@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: dtolnay/rust-toolchain@72e0b3f2339874da45e95c19a5ad418a9994f7a5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
@@ -42,7 +42,7 @@ jobs:
           if [ "${GITHUB_REPOSITORY##*/}" = "docs-site" ]; then
             git clone --depth 1 https://github.com/orogen-network/landing-site ../landing-site
           fi
-      - uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9
+      - uses: actions/cache@v4
         if: ${{ hashFiles('Cargo.toml') != '' }}
         with:
           path: |
