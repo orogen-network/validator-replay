@@ -35,6 +35,27 @@ Independent replay needs the original request input, not only the receipt hash.
 - Validators that need longer retention must store encrypted inputs in their own
   audited evidence vault and submit only the needed replay batch to this service.
 
+## Replay comparison mode
+
+Exact-hash replay only works when inference is deterministic. Real GPU/CPU
+inference is not bit-reproducible, so a byte-identical `response_hash` check
+would slash honest operators for ordinary floating-point / kernel
+non-determinism. Two modes are available, selected by `VALIDATOR_REPLAY_MODE`
+(default `exact`):
+
+- `exact` — byte-identical `sha256(response_text)` comparison. This is the
+  default and what the deterministic mock workers + the coordination e2e/chaos
+  gate exercise.
+- `tolerant` — compares token-id overlap and top-logprob agreement against
+  `VALIDATOR_REPLAY_TOLERANCE` (default `0.98`). The validator pulls the
+  worker's token-id / top-logprob evidence (the additive fields the workers now
+  return on `/v1/replay`) as the recomputed side and scores it against the
+  claimed evidence. A single sub-threshold divergence is a MATCH; only a
+  divergence beyond the tolerance is a slashable MISMATCH. Repeated material
+  mismatches per operator are tracked via `MaterialMismatchTracker` so a one-off
+  borderline divergence does not slash. If token evidence is unavailable,
+  tolerant mode falls back to the exact comparison so it is never weaker.
+
 ## Chain RPC
 
 `chain_rpc_url` defaults to `ws://127.0.0.1:9944`. Override via the

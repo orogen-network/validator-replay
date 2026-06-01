@@ -20,7 +20,18 @@ from validator_replay.chain import (
     _encode_slashing_extrinsic,
     _to_32,
 )
-from validator_replay.replay import ReplayVerdict, replay_receipt
+from validator_replay.replay import (
+    MaterialMismatchTracker,
+    ReplayMode,
+    ReplayVerdict,
+    TokenEvidence,
+    logprob_agreement,
+    replay_receipt,
+    resolved_replay_mode,
+    resolved_tolerance,
+    token_overlap_ratio,
+    tolerant_score,
+)
 from validator_replay.sampler import CommitReveal, StakeWeightedSampler
 
 
@@ -120,6 +131,142 @@ def test_replay_model_mismatch() -> None:
     out = replay_receipt(r, expected_model_weight_hash="w-B")
     assert out.verdict == ReplayVerdict.MISMATCH
     assert out.fault and out.fault.value == "WrongModel"
+
+
+# ------------------------------------------------------------------ tolerant mode
+
+
+def test_replay_mode_defaults_to_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VALIDATOR_REPLAY_MODE", raising=False)
+    assert resolved_replay_mode() is ReplayMode.EXACT
+
+
+def test_replay_mode_resolves_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALIDATOR_REPLAY_MODE", "tolerant")
+    assert resolved_replay_mode() is ReplayMode.TOLERANT
+
+
+def test_replay_mode_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="unknown VALIDATOR_REPLAY_MODE"):
+        resolved_replay_mode("loose")
+
+
+def test_tolerance_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VALIDATOR_REPLAY_TOLERANCE", raising=False)
+    assert resolved_tolerance() == 0.98
+    assert resolved_tolerance(2.0) == 1.0
+    assert resolved_tolerance(-1.0) == 0.0
+
+
+def test_token_overlap_and_logprob_agreement() -> None:
+    assert token_overlap_ratio([], []) == 1.0
+    assert token_overlap_ratio([1, 2, 3, 4], [1, 2, 3, 4]) == 1.0
+    assert token_overlap_ratio([1, 2, 3, 4], [1, 2, 9, 9]) == 0.5
+    # length mismatch penalised against the longer sequence
+    assert token_overlap_ratio([1, 2], [1, 2, 3, 4]) == 0.5
+    assert logprob_agreement([-0.1, -0.2], [-0.1, -0.25]) == 1.0
+    assert logprob_agreement([-0.1, -0.2], [-5.0, -0.2]) == 0.5
+
+
+def test_tolerant_near_identical_is_match() -> None:
+    r = _make_receipt("op", "j-tol-1", response_hash="exact-would-fail")
+    claimed = {
+        "token_ids": list(range(100)),
+        "top_logprobs": [-0.1] * 100,
+    }
+    # One token differs out of 100 -> 0.99 overlap, above the 0.98 default.
+    recomputed = {
+        "token_ids": [*range(99), 9999],
+        "top_logprobs": [-0.1] * 100,
+    }
+    out = replay_receipt(
+        r,
+        mode=ReplayMode.TOLERANT,
+        expected_response_hash="different-hash-on-purpose",
+        claimed_token_evidence=claimed,
+        recomputed_token_evidence=recomputed,
+    )
+    assert out.verdict == ReplayVerdict.MATCH
+    assert out.score is not None and out.score >= 0.98
+
+
+def test_tolerant_very_different_is_mismatch() -> None:
+    r = _make_receipt("op", "j-tol-2", response_hash="rs")
+    claimed = {"token_ids": list(range(100)), "top_logprobs": [-0.1] * 100}
+    recomputed = {
+        "token_ids": list(range(1000, 1100)),  # entirely different
+        "top_logprobs": [-4.0] * 100,
+    }
+    out = replay_receipt(
+        r,
+        mode=ReplayMode.TOLERANT,
+        expected_response_hash="rs",  # exact would MATCH; tolerant must MISMATCH
+        claimed_token_evidence=claimed,
+        recomputed_token_evidence=recomputed,
+    )
+    assert out.verdict == ReplayVerdict.MISMATCH
+    assert out.fault and out.fault.value == "WrongResponse"
+    assert out.score is not None and out.score < 0.98
+
+
+def test_tolerant_falls_back_to_exact_without_evidence() -> None:
+    """Tolerant mode with no token evidence must not be weaker than exact."""
+    r = _make_receipt("op", "j-tol-3", response_hash="rs")
+    out = replay_receipt(r, mode=ReplayMode.TOLERANT, expected_response_hash="WRONG")
+    assert out.verdict == ReplayVerdict.MISMATCH
+    assert out.fault and out.fault.value == "WrongResponse"
+
+
+def test_tolerant_score_takes_worse_signal() -> None:
+    claimed = TokenEvidence(token_ids=[1, 2, 3, 4], top_logprobs=[-0.1, -0.1, -0.1, -0.1])
+    # Tokens fully agree but logprobs all diverge.
+    recomputed = TokenEvidence(token_ids=[1, 2, 3, 4], top_logprobs=[-9.0, -9.0, -9.0, -9.0])
+    assert tolerant_score(claimed, recomputed) == 0.0
+
+
+def test_material_mismatch_tracker() -> None:
+    t = MaterialMismatchTracker(threshold=3)
+    assert not t.is_material("op-x")
+    t.record("op-x")
+    t.record("op-x")
+    assert not t.is_material("op-x")
+    t.record("op-x")
+    assert t.is_material("op-x")
+    t.reset("op-x")
+    assert not t.is_material("op-x")
+
+
+@respx.mock
+def test_tolerant_worker_replay_uses_full_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: in tolerant mode the validator pulls the worker's token
+    evidence (full body) as the recomputed side."""
+    monkeypatch.setenv("VALIDATOR_REPLAY_MODE", "tolerant")
+    receipt = _make_receipt("op-1", "j-tol-worker", response_hash="claimed-hash")
+    respx.post("http://worker.test/v1/replay").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "response_hash": "fresh-hash",  # differs, but tolerant ignores it
+                "token_ids": [1, 2, 3, 4],
+                "top_logprobs": [-0.1, -0.1, -0.1, -0.1],
+            },
+        )
+    )
+    out = replay_receipt(
+        receipt,
+        worker_url="http://worker.test",
+        replay_input={
+            **_replay_input(),
+            "claimed_token_evidence": {
+                "token_ids": [1, 2, 3, 4],
+                "top_logprobs": [-0.1, -0.1, -0.1, -0.1],
+            },
+        },
+    )
+    assert out.verdict == ReplayVerdict.MATCH
+    assert out.score == 1.0
 
 
 def test_healthz(config: ValidatorConfig) -> None:
