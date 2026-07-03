@@ -461,33 +461,85 @@ def test_to_32_accepts_64_char_hex() -> None:
     assert out2 == bytes.fromhex("cd" * 32)
 
 
+class _FakeScaleValue:
+    """Mimics a `substrate-interface` `ScaleType` over the `Operator` struct:
+    `.get(field).value` returns the decoded field value."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def get(self, field: str) -> _FakeScaleValue | None:
+        # `value` is a dict of decoded fields for the Operator struct.
+        fields = self.value if isinstance(self.value, dict) else {}
+        v = fields.get(field)
+        return None if v is None else _FakeScaleValue(v)
+
+
+class _FakeStorageKey:
+    """Mimics a `substrate-interface` `StorageKey`: `.params` holds the decoded
+    map-key values (here the ss58/hex AccountId string)."""
+
+    def __init__(self, account: str) -> None:
+        self.params = [account]
+        self.storage_key = "0x" + "00" * 16 + account
+
+
+class _FakeSubstrate:
+    """Mimics `substrate-interface`'s `query_map` for `OperatorStake.Operators`."""
+
+    def __init__(self, rows: list[tuple[str, int, bool]]) -> None:
+        self._rows = rows
+
+    def query_map(self, pallet: str, storage: str) -> list[tuple[_FakeStorageKey, _FakeScaleValue]]:
+        assert (pallet, storage) == ("OperatorStake", "Operators")
+        return [
+            (
+                _FakeStorageKey(account),
+                _FakeScaleValue({"stake": stake, "frozen": frozen}),
+            )
+            for account, stake, frozen in self._rows
+        ]
+
+
 def test_chain_rpc_uses_real_response_when_reachable() -> None:
-    """When the RPC endpoint responds, decode the operators payload."""
+    """When the RPC endpoint responds, decode the operators from the
+    `OperatorStake.Operators` storage map."""
+    fake_substrate = _FakeSubstrate(
+        [
+            ("11" * 32, 9_999, False),
+            ("22" * 32, 42_000, False),
+        ]
+    )
     with respx.mock(base_url="http://example.test") as router:
-        # Probe succeeds.
-        router.post(
-            "/", name="all"
-        ).mock(
-            side_effect=[
-                httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x"}),
-                httpx.Response(
-                    200,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": _encode_operators_hex(
-                            [(b"\x11" * 32, 9_999), (b"\x22" * 32, 42_000)]
-                        ),
-                    },
-                ),
-            ]
+        # Probe succeeds (system_chain returns 200). The storage read goes
+        # through the substrate client, not the raw httpx probe.
+        router.post("/", name="probe").mock(
+            return_value=httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 1, "result": "Orogen Forge"}
+            )
         )
         client = ChainRpcClient("http://example.test/")
+        client._substrate = fake_substrate  # type: ignore[attr-defined]
         ops = client.get_operator_stakes()
-    assert {(o.operator_id, o.stake) for o in ops} == {
-        ("11" * 32, 9_999),
-        ("22" * 32, 42_000),
+    assert {(o.operator_id, o.stake, o.active) for o in ops} == {
+        ("11" * 32, 9_999, True),
+        ("22" * 32, 42_000, True),
     }
+
+
+def test_chain_rpc_marks_frozen_operators_inactive() -> None:
+    """A frozen operator (`frozen=true`) decodes as `active=False`."""
+    fake_substrate = _FakeSubstrate([("11" * 32, 9_999, True)])
+    with respx.mock(base_url="http://example.test") as router:
+        router.post("/", name="probe").mock(
+            return_value=httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 1, "result": "Orogen Forge"}
+            )
+        )
+        client = ChainRpcClient("http://example.test/")
+        client._substrate = fake_substrate  # type: ignore[attr-defined]
+        ops = client.get_operator_stakes()
+    assert ops[0].active is False
 
 
 def test_chain_rpc_submits_slashing_extrinsic_when_reachable() -> None:
@@ -499,9 +551,7 @@ def test_chain_rpc_submits_slashing_extrinsic_when_reachable() -> None:
         related_receipt_hash="44" * 32,
     )
     with respx.mock(base_url="http://example.test") as router:
-        route = router.post(
-            "/", name="all"
-        ).mock(
+        route = router.post("/", name="all").mock(
             side_effect=[
                 httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x"}),
                 httpx.Response(
@@ -546,16 +596,6 @@ def test_scale_compact_roundtrip() -> None:
         decoded, offset = _decode_compact(encoded, 0)
         assert decoded == v
         assert offset == len(encoded)
-
-
-def _encode_operators_hex(operators: list[tuple[bytes, int]]) -> str:
-    """Helper: encode a `Vec<(AccountId, Balance)>` as the chain would."""
-    out = bytearray(_encode_compact(len(operators)))
-    for account, balance in operators:
-        assert len(account) == 32
-        out.extend(account)
-        out.extend(int.to_bytes(balance, 16, "little"))
-    return "0x" + out.hex()
 
 
 # ------------------------------------------------------------------ worker replay

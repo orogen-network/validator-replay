@@ -96,6 +96,8 @@ class ChainRpcClient:
         self._http_url = _ws_to_http(rpc_url)
         # Retry policy (C-04): exponential backoff up to ~700 ms total.
         self._retry_backoffs_s = (0.1, 0.2, 0.4)
+        # Lazily-built substrate-interface client; created on first use.
+        self._substrate: Any = None
 
     # ------------------------------------------------------------------ probe
 
@@ -126,15 +128,42 @@ class ChainRpcClient:
                 return True
         return False
 
+    def _substrate_client(self) -> Any:
+        """Build (once) a `substrate-interface` client pointed at `rpc_url`.
+
+        Operator stakes are read via a storage query against
+        `OperatorStake.Operators` (a Blake2_128Concat map of
+        `AccountId -> Operator { stake, last_heartbeat_epoch, ... frozen }`).
+        The runtime exposes no custom `OperatorStakeApi_*` runtime API, so the
+        previous `state_call("OperatorStakeApi_operators")` path failed on the
+        live chain ("Exported method not found"). `substrate-interface` handles
+        the storage-key hashing and SCALE decoding, matching the
+        `@polkadot/api` path the `drive-epoch0.cjs` driver uses.
+        """
+        if self._substrate is None:
+            try:
+                from substrateinterface import SubstrateInterface  # type: ignore
+            except ImportError as exc:  # pragma: no cover - prod has the dep
+                raise ChainUnreachableError(
+                    "substrate-interface is required to read operator stakes; "
+                    "install validator-replay with the chain dependency."
+                ) from exc
+            self._substrate = SubstrateInterface(
+                url=self.rpc_url, ss58_format=42
+            )
+        return self._substrate
+
     # ---------------------------------------------------- operators
     def get_operator_stakes(self) -> list[OperatorStake]:
         """Read the active operator set + per-operator stake.
 
-        Raises `ChainUnreachableError` on RPC failure unless
-        `VALIDATOR_ALLOW_STUB_CHAIN=1` is set. The implicit fallback to
-        stub operator data has been removed (C-04) — silently substituting
-        attacker-shaped operator IDs into slashing extrinsics is what made
-        the validator forge-targetable in the first place.
+        Reads the `OperatorStake.Operators` storage map via `substrate-interface`
+        (storage query, not a custom runtime API which the runtime does not
+        expose). Raises `ChainUnreachableError` on RPC failure unless
+        `VALIDATOR_ALLOW_STUB_CHAIN=1` is set. The implicit fallback to stub
+        operator data has been removed (C-04) — silently substituting
+        attacker-shaped operator IDs into slashing extrinsics is what made the
+        validator forge-targetable in the first place.
         """
         if not self._probe_with_retry():
             if _stub_enabled():
@@ -150,41 +179,34 @@ class ChainRpcClient:
                 f"(test-only).",
             )
         try:
-            with httpx.Client(timeout=RPC_CALL_TIMEOUT_S) as client:
-                # We use a runtime API call exposed by pallet-operator-stake:
-                # `OperatorStakeApi_operators` — returns SCALE-encoded
-                # `Vec<(AccountId, Balance)>`. The chain-side runtime API
-                # decode lives in pallet-suite; here we just fetch the raw
-                # bytes and let SCALE-decode happen client-side.
-                resp = client.post(
-                    self._http_url,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "state_call",
-                        "params": ["OperatorStakeApi_operators", "0x"],
-                    },
-                )
-                resp.raise_for_status()
-                envelope = resp.json()
-                if "error" in envelope:
-                    if _stub_enabled():
-                        logger.warning(
-                            "OperatorStakeApi_operators error: %s — using stub",
-                            envelope["error"],
-                        )
-                        return _stub_operators()
-                    raise ChainUnreachableError(
-                        f"OperatorStakeApi_operators returned error: "
-                        f"{envelope['error']!r}",
+            substrate = self._substrate_client()
+            # query_map iterates the storage map; each row is (key, value)
+            # where `key` is a StorageKey whose `.params` is the decoded
+            # AccountId (ss58 string) and `value` is a ScaleType over the
+            # `Operator` struct.
+            rows: list[OperatorStake] = []
+            for key, op in substrate.query_map("OperatorStake", "Operators"):
+                stake = int(op.get("stake").value) if op.get("stake") is not None else 0
+                frozen = bool(op.get("frozen").value) if op.get("frozen") is not None else False
+                account = _account_from_key(key)
+                rows.append(
+                    OperatorStake(
+                        operator_id=account,
+                        stake=stake,
+                        active=not frozen,
                     )
-                return _decode_operators_hex(envelope.get("result", "0x"))
-        except (httpx.HTTPError, OSError) as exc:
+                )
+            return rows
+        except ChainUnreachableError:
+            raise
+        except Exception as exc:
             if _stub_enabled():
-                logger.warning("OperatorStakeApi RPC failed (%s) — using stub", exc)
+                logger.warning(
+                    "OperatorStake storage query failed (%s) — using stub", exc
+                )
                 return _stub_operators()
             raise ChainUnreachableError(
-                f"OperatorStakeApi RPC failed: {exc!r}",
+                f"OperatorStake storage query failed: {exc!r}",
             ) from exc
 
     # ---------------------------------------------------- slashing
@@ -270,32 +292,25 @@ def _ws_to_http(url: str) -> str:
     return url
 
 
-def _decode_operators_hex(hex_str: str) -> list[OperatorStake]:
-    """Decode the `OperatorStakeApi_operators` response.
+def _account_from_key(key: Any) -> str:
+    """Extract the operator AccountId from a `substrate-interface` storage key.
 
-    The chain-side encoding is `SCALE(Vec<(AccountId32, Balance)>)`. The
-    full SCALE codec is in `parity-scale-codec` (Rust); on the Python side
-    we hand-decode the layout for this single API since it's stable per
-    RFC-0009 and the dependency surface should stay small.
+    `query_map` yields a `StorageKey` whose `.params` is the list of decoded
+    map-key values (here: the ss58 AccountId string). Fall back to the raw
+    32-byte account suffix when params aren't populated (older substrate
+    builds), returning the hex form the rest of the pipeline accepts.
     """
-    if not hex_str or hex_str == "0x":
-        return []
-    raw = bytes.fromhex(hex_str.removeprefix("0x"))
-    n, offset = _decode_compact(raw, 0)
-    out: list[OperatorStake] = []
-    for _ in range(n):
-        account = raw[offset : offset + 32]
-        offset += 32
-        balance = int.from_bytes(raw[offset : offset + 16], "little")
-        offset += 16
-        out.append(
-            OperatorStake(
-                operator_id=account.hex(),
-                stake=balance,
-                active=True,
-            )
-        )
-    return out
+    params = getattr(key, "params", None) or []
+    if params and isinstance(params[0], str):
+        return params[0]
+    # Fallback: the storage key ends with the Blake2_128Concat account bytes
+    # (16-byte hash || 32-byte account). Pull the trailing 32 bytes.
+    raw = getattr(key, "storage_key", None) or bytes(getattr(key, "data", b"") or b"")
+    if isinstance(raw, str):
+        raw = bytes.fromhex(raw.removeprefix("0x"))
+    if raw and len(raw) >= 32:
+        return raw[-32:].hex()
+    raise ChainUnreachableError("could not decode operator AccountId from storage key")
 
 
 def _decode_compact(buf: bytes, offset: int) -> tuple[int, int]:
