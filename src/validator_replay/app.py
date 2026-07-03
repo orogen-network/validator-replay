@@ -24,11 +24,18 @@ from mining_types import Receipt, SlashingEvidence
 from mining_types.crypto import sha256_hex, verify_ed25519
 from pydantic import BaseModel, Field
 
-from validator_replay.chain import ChainRpcClient, ChainUnreachableError
+from validator_replay.chain import ChainRpcClient, ChainUnreachableError, OperatorStake
 from validator_replay.config import ValidatorConfig
 from validator_replay.registry import OperatorRegistry, allow_unsigned_ingest
 from validator_replay.replay import ReplayResult, ReplayVerdict, replay_receipt
 from validator_replay.sampler import CommitReveal, StakeWeightedSampler
+from validator_replay.weights import (
+    compute_weight_vector,
+    encode_submit_weights_call,
+)
+from validator_replay.weights import (
+    submit_weights as submit_yuma_weights,
+)
 
 logger = logging.getLogger(__name__)
 _BEARER = HTTPBearer(auto_error=False)
@@ -82,6 +89,22 @@ class RunEpochRequest(BaseModel):
     epoch_seed: str
     operator_stake: dict[str, int] = Field(default_factory=dict)
     replay_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class SubmitWeightsRequest(BaseModel):
+    """Compute + sign + submit a Yuma weight vector for one epoch.
+
+    Reward-crank #3: the validator's per-epoch quality vote. `epoch` is the
+    Yuma epoch label (u64). `faulty_operators` is the set of operator_ids
+    (hex AccountIds) that produced a MISMATCH this epoch — these get weight 0.
+    When `faulty_operators` is empty (the bootstrap / no-fault case), every
+    active operator gets `u16::MAX`, matching the `drive-epoch0.cjs` stand-in.
+    """
+
+    epoch: int
+    faulty_operators: set[str] = Field(default_factory=set)
+    equal_weight: bool = True
+    operator_stake: dict[str, int] = Field(default_factory=dict)
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -436,6 +459,65 @@ def build_app(
             # N-W-01: receipt-sig rejection counters.
             "rejected_unknown_operator": unknown,
             "rejected_invalid_signature": invalid,
+        }
+
+    @app.post("/submit_weights", dependencies=[Depends(require_validator_auth)])
+    async def submit_weights(req: SubmitWeightsRequest) -> dict[str, Any]:
+        """Compute + sign + submit `YumaConsensus.submit_weights(epoch, vector)`.
+
+        Reward-crank #3: this is the validator's per-epoch quality vote that
+        the reward crank turns on. The validator's sr25519 key
+        (`config.validator_private_key_hex`) signs the extrinsic; the live
+        runtime gates it by `EpochPermittedValidators[epoch]`.
+
+        C-04: on chain-RPC failure this RAISES (503) unless stub fallback is
+        opted into, in which case the vector is computed + returned but not
+        submitted (`tx_hash` is null).
+        """
+        if not config.validator_private_key_hex:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "validator_private_key_hex is not configured; the validator "
+                    "cannot sign a submit_weights extrinsic without its key."
+                ),
+            )
+        # Pull the active operator set + stakes from the chain unless the
+        # caller passed an explicit override (e.g. a dry-run with a fixture).
+        if req.operator_stake:
+            operators = [
+                OperatorStake(
+                    operator_id=op_id, stake=stake, active=True,
+                )
+                for op_id, stake in req.operator_stake.items()
+            ]
+        else:
+            try:
+                operators = app.state.chain_client.get_operator_stakes()
+            except ChainUnreachableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        vec = compute_weight_vector(
+            epoch=req.epoch,
+            operators=operators,
+            faulty_operators=req.faulty_operators,
+            equal_weight=req.equal_weight,
+        )
+        body_hex = encode_submit_weights_call(req.epoch, vec).hex()
+        try:
+            tx_hash = submit_yuma_weights(
+                app.state.chain_client,
+                epoch=req.epoch,
+                vector=vec,
+                validator_private_key_hex=config.validator_private_key_hex,
+            )
+        except ChainUnreachableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "epoch": req.epoch,
+            "operator_count": len(vec.entries),
+            "call_body_hex": body_hex,
+            "tx_hash": tx_hash,
+            "submitted_to_chain": tx_hash is not None,
         }
 
     @app.get("/internal/slashings", dependencies=[Depends(require_validator_auth)])
