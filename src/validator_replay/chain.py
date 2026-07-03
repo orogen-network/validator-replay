@@ -343,11 +343,13 @@ def _encode_slashing_extrinsic(ev: SlashingEvidence) -> bytes:
             related_receipt_hash: Option<H256>,
         }
 
-    Pallet/call indices are governed by the runtime build; we use the
-    canonical values reserved in RFC-0009 §6 (pallet=42, call=0) until
-    chain-tooling-rust publishes a metadata file.
+    Pallet/call indices are governed by the runtime `construct_runtime!`.
+    The Orogen runtime assigns `pallet_slashing = 15` (see
+    pallet-suite/runtime/src/lib.rs) and `submit_slashing_evidence` is
+    `call_index(0)`. The previous value `pallet=42` was a placeholder that
+    would have dispatched to a non-existent pallet on the live chain.
     """
-    PALLET_INDEX = 42
+    PALLET_INDEX = 15
     CALL_INDEX = 0
 
     out = bytearray()

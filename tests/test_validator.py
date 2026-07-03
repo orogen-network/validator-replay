@@ -530,7 +530,7 @@ def test_slashing_extrinsic_encoding_matches_rfc0005_shape() -> None:
     # pallet/call index + 32-byte op + 1-byte fault + 32-byte evidence
     # + 1-byte Option(None) tag + (1+32) Option(Some) = 2 + 32 + 1 + 32 + 1 + 33
     assert len(body) == 101
-    assert body[0] == 42  # PALLET_INDEX
+    assert body[0] == 15  # PALLET_INDEX (pallet_slashing = 15 in the Orogen runtime)
     assert body[1] == 0  # CALL_INDEX
     # Fault-code index: WrongModel=0, WrongResponse=1, ..., QuantizationSwap=4.
     assert body[2 + 32] == 4
